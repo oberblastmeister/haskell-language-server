@@ -135,6 +135,25 @@ import           GHC.Hs                            (LEpaComment)
 import qualified GHC.Types.Error                   as Error
 #endif
 
+#if MIN_VERSION_ghc(9,3,0)
+import GHC.Iface.Recomp (CompileReason(..))
+import GHC.Driver.Env.Types (hsc_type_env_vars)
+import GHC.Driver.Env (hscUpdateHUG, hscUpdateHPT, hsc_HUG)
+import GHC.Driver.Env.KnotVars
+import GHC.Iface.Recomp
+import GHC.Linker.Types
+import GHC.Unit.Module.Graph
+import GHC.Driver.Errors.Types
+import GHC.Types.Unique.Map
+import GHC.Types.Unique
+import GHC.Utils.TmpFs
+import GHC.Utils.Panic
+import GHC.Unit.Finder.Types
+import GHC.Unit.Env
+import GHC.Driver.Phases
+import GHC.Driver.Config.Tidy
+#endif
+
 -- | Given a string buffer, return the string (after preprocessing) and the 'ParsedModule'.
 parseModule
     :: IdeOptions
@@ -219,7 +238,12 @@ captureSplicesAndDeps TypecheckHelpers{..} env k = do
     -- names in the compiled bytecode, recording the modules that those names
     -- come from in the IORef,, as these are the modules on whose implementation
     -- we depend.
-    compile_bco_hook :: IORef (ModuleEnv BS.ByteString) -> HscEnv -> SrcSpan -> CoreExpr -> IO ForeignHValue
+    compile_bco_hook :: IORef (ModuleEnv BS.ByteString) -> HscEnv -> SrcSpan -> CoreExpr
+#if MIN_VERSION_ghc(9,3,0)
+                     -> IO (ForeignHValue, [Linkable], PkgsLoaded)
+#else
+                     -> IO ForeignHValue
+#endif
     compile_bco_hook var hsc_env srcspan ds_expr
       = do { let dflags = hsc_dflags hsc_env
 
@@ -240,13 +264,21 @@ captureSplicesAndDeps TypecheckHelpers{..} env k = do
            ; let iNTERACTIVELoc = G.ModLocation{ ml_hs_file   = Nothing,
                                         ml_hi_file   = panic "hscCompileCoreExpr':ml_hi_file",
                                         ml_obj_file  = panic "hscCompileCoreExpr':ml_obj_file",
-                                        ml_hie_file  = panic "hscCompileCoreExpr':ml_hie_file" }
+#if MIN_VERSION_ghc(9,3,0)
+                                        ml_dyn_obj_file = panic "hscCompileCoreExpr':ml_dyn_obj_file",
+                                        ml_dyn_hi_file  = panic "hscCompileCoreExpr':ml_dyn_hi_file",
+#endif
+                                        ml_hie_file  = panic "hscCompileCoreExpr':ml_hie_file"
+                                        }
            ; let ictxt = hsc_IC hsc_env
 
            ; (binding_id, stg_expr, _, _) <-
                myCoreToStgExpr (hsc_logger hsc_env)
                                (hsc_dflags hsc_env)
                                ictxt
+#if MIN_VERSION_ghc(9,3,0)
+                               True -- for bytecode
+#endif
                                (icInteractiveModule ictxt)
                                iNTERACTIVELoc
                                prepd_expr
@@ -277,6 +309,7 @@ captureSplicesAndDeps TypecheckHelpers{..} env k = do
                                          , Just mod <- [nameModule_maybe n] -- Names from other modules
                                          , not (isWiredInName n) -- Exclude wired-in names
                                          , moduleUnitId mod == uid -- Only care about stuff from the home package
+                                         -- TODO wz1000
                                          ]
                  hpt = hsc_HPT hsc_env
                  uid = homeUnitId_ dflags
@@ -294,14 +327,18 @@ captureSplicesAndDeps TypecheckHelpers{..} env k = do
                                                              , let ms   = fromJust $ mgLookupModule (hsc_mod_graph hsc_env) mod
                                                              , let file = fromJust $ ml_hs_file $ ms_location ms
                                                              ]
-           ; let hsc_env' = hsc_env { hsc_HPT = addListToHpt hpt [(moduleName $ mi_module $ hm_iface hm, hm) | lb <- lbs, let hm = linkableHomeMod lb] }
+           ; let hsc_env' = loadModulesHome (map linkableHomeMod lbs) hsc_env
 
              -- Essential to do this here after we load the linkables
            ; keep_lbls <- getLinkablesToKeep
 
            ; unload hsc_env' $ map (\(mod, time) -> LM time mod []) $ moduleEnvToList keep_lbls
 
-#if MIN_VERSION_ghc(9,2,0)
+#if MIN_VERSION_ghc(9,3,0)
+             {- load it -}
+           ; (fv_hvs, lbss, pkgs) <- loadDecls (hscInterp hsc_env') hsc_env' srcspan bcos
+           ; let hval = ((expectJust "hscCompileCoreExpr'" $ lookup (idName binding_id) fv_hvs), lbss, pkgs)
+#elif MIN_VERSION_ghc(9,2,0)
              {- load it -}
            ; fv_hvs <- loadDecls (hscInterp hsc_env') hsc_env' srcspan bcos
            ; let hval = (expectJust "hscCompileCoreExpr'" $ lookup (idName binding_id) fv_hvs)
@@ -387,10 +424,20 @@ mkHiFileResultNoCompile session tcm = do
   let hsc_env_tmp = hscSetFlags (ms_hspp_opts ms) session
       ms = pm_mod_summary $ tmrParsed tcm
       tcGblEnv = tmrTypechecked tcm
-  details <- makeSimpleDetails hsc_env_tmp tcGblEnv
+  details <- makeSimpleDetails
+#if MIN_VERSION_ghc(9,3,0)
+              (hsc_logger hsc_env_tmp)
+#else
+              hsc_env_tmp
+#endif
+              tcGblEnv
   sf <- finalSafeMode (ms_hspp_opts ms) tcGblEnv
 #if MIN_VERSION_ghc(8,10,0)
-  iface <- mkIfaceTc hsc_env_tmp sf details tcGblEnv
+  iface <- mkIfaceTc hsc_env_tmp sf details
+#if MIN_VERSION_ghc(9,3,0)
+              ms
+#endif
+              tcGblEnv
 #else
   (iface, _) <- mkIfaceTc hsc_env_tmp Nothing sf details tcGblEnv
 #endif
@@ -410,16 +457,32 @@ mkHiFileResultCompile se session' tcm simplified_guts = catchErrs $ do
   (details, mguts) <-
     if mg_hsc_src simplified_guts == HsBootFile
     then do
-        details <- mkBootModDetailsTc session tcGblEnv
+        details <- mkBootModDetailsTc
+#if MIN_VERSION_ghc(9,3,0)
+          (hsc_logger session)
+#else
+          session
+#endif
+          tcGblEnv
         pure (details, Nothing)
     else do
         -- write core file
         -- give variables unique OccNames
-        (guts, details) <- tidyProgram session simplified_guts
+#if MIN_VERSION_ghc(9,3,0)
+        tidy_opts <- initTidyOpts session
+#else
+        let tidy_opts = session
+#endif
+        (guts, details) <- tidyProgram tidy_opts simplified_guts
         pure (details, Just guts)
 
 #if MIN_VERSION_ghc(9,0,1)
-  let !partial_iface = force (mkPartialIface session details simplified_guts)
+  let !partial_iface = force $ mkPartialIface session details
+#if MIN_VERSION_ghc(9,3,0)
+                                              ms
+#endif
+                                              simplified_guts
+
   final_iface <- mkFullIface session partial_iface Nothing
 #elif MIN_VERSION_ghc(8,10,0)
   let !partial_iface = force (mkPartialIface session details simplified_guts)
@@ -463,8 +526,18 @@ mkHiFileResultCompile se session' tcm simplified_guts = catchErrs $ do
 
       -- Run corePrep first as we want to test the final version of the program that will
       -- get translated to STG/Bytecode
-      (prepd_binds , _) <- corePrepPgm session mod (ms_location ms) unprep_binds data_tycons
-      (prepd_binds', _) <- corePrepPgm session mod (ms_location ms) unprep_binds' data_tycons
+#if MIN_VERSION_ghc(9,3,0)
+      prepd_binds
+#else
+      (prepd_binds , _)
+#endif
+        <- corePrepPgm session mod (ms_location ms) unprep_binds data_tycons
+#if MIN_VERSION_ghc(9,3,0)
+      prepd_binds'
+#else
+      (prepd_binds', _)
+#endif
+        <- corePrepPgm session mod (ms_location ms) unprep_binds' data_tycons
       let binds  = noUnfoldings $ (map flattenBinds . (:[])) $ prepd_binds
           binds' = noUnfoldings $ (map flattenBinds . (:[])) $ prepd_binds'
 
@@ -551,7 +624,13 @@ generateObjectCode session summary guts = do
                 withWarnings "object" $ \tweak -> do
                       let env' = tweak (hscSetFlags (ms_hspp_opts summary) session)
                           target = platformDefaultBackend (hsc_dflags env')
-                          newFlags = setBackend target $ updOptLevel 0 $ setOutputFile dot_o $ hsc_dflags env'
+                          newFlags = setBackend target $ updOptLevel 0 $ setOutputFile
+#if MIN_VERSION_ghc(9,3,0)
+                              (Just dot_o)
+#else
+                              dot_o
+#endif
+                            $ hsc_dflags env'
                           session' = hscSetFlags newFlags session
 #if MIN_VERSION_ghc(9,0,1)
                       (outputFilename, _mStub, _foreign_files, _cinfos) <- hscGenHardCode session' guts
@@ -564,7 +643,20 @@ generateObjectCode session summary guts = do
                                 summary
 #endif
                                 fp
-                      compileFile session' StopLn (outputFilename, Just (As False))
+                      obj <- compileFile session'
+#if MIN_VERSION_ghc(9,3,0)
+                                         NoStop
+#else
+                                         StopLn
+#endif
+                                         (outputFilename, Just (As False))
+#if MIN_VERSION_ghc(9,3,0)
+                      case obj of
+                        Nothing -> throwGhcExceptionIO $ Panic "compileFile didn't generate object code"
+                        Just x -> pure x
+#else
+                      return obj
+#endif
               let unlinked = DotO dot_o_fp
               -- Need time to be the modification time for recompilation checking
               t <- liftIO $ getModificationTime dot_o_fp
@@ -613,10 +705,17 @@ update_pm_mod_summary :: (ModSummary -> ModSummary) -> ParsedModule -> ParsedMod
 update_pm_mod_summary up pm =
   pm{pm_mod_summary = up $ pm_mod_summary pm}
 
+#if MIN_VERSION_ghc(9,3,0)
+unDefer :: (Maybe DiagnosticReason, FileDiagnostic) -> (Bool, FileDiagnostic)
+unDefer (Just (WarningWithFlag Opt_WarnDeferredTypeErrors)         , fd) = (True, upgradeWarningToError fd)
+unDefer (Just (WarningWithFlag Opt_WarnTypedHoles)                 , fd) = (True, upgradeWarningToError fd)
+unDefer (Just (WarningWithFlag Opt_WarnDeferredOutOfScopeVariables), fd) = (True, upgradeWarningToError fd)
+#else
 unDefer :: (WarnReason, FileDiagnostic) -> (Bool, FileDiagnostic)
 unDefer (Reason Opt_WarnDeferredTypeErrors         , fd) = (True, upgradeWarningToError fd)
 unDefer (Reason Opt_WarnTypedHoles                 , fd) = (True, upgradeWarningToError fd)
 unDefer (Reason Opt_WarnDeferredOutOfScopeVariables, fd) = (True, upgradeWarningToError fd)
+#endif
 unDefer ( _                                        , fd) = (False, fd)
 
 upgradeWarningToError :: FileDiagnostic -> FileDiagnostic
@@ -625,10 +724,15 @@ upgradeWarningToError (nfp, sh, fd) =
   warn2err :: T.Text -> T.Text
   warn2err = T.intercalate ": error:" . T.splitOn ": warning:"
 
+#if MIN_VERSION_ghc(9,3,0)
+hideDiag :: DynFlags -> (Maybe DiagnosticReason, FileDiagnostic) -> (Maybe DiagnosticReason, FileDiagnostic)
+hideDiag originalFlags (w@(Just (WarningWithFlag warning)), (nfp, _sh, fd))
+#else
 hideDiag :: DynFlags -> (WarnReason, FileDiagnostic) -> (WarnReason, FileDiagnostic)
-hideDiag originalFlags (Reason warning, (nfp, _sh, fd))
+hideDiag originalFlags (w@(Reason warning), (nfp, _sh, fd))
+#endif
   | not (wopt warning originalFlags)
-  = (Reason warning, (nfp, HideDiag, fd))
+  = (w, (nfp, HideDiag, fd))
 hideDiag _originalFlags t = t
 
 -- | Warnings which lead to a diagnostic tag
@@ -649,10 +753,15 @@ unnecessaryDeprecationWarningFlags
     ]
 
 -- | Add a unnecessary/deprecated tag to the required diagnostics.
+#if MIN_VERSION_ghc(9,3,0)
+tagDiag :: (Maybe DiagnosticReason, FileDiagnostic) -> (Maybe DiagnosticReason, FileDiagnostic)
+tagDiag (w@(Just (WarningWithFlag warning)), (nfp, sh, fd))
+#else
 tagDiag :: (WarnReason, FileDiagnostic) -> (WarnReason, FileDiagnostic)
-tagDiag (Reason warning, (nfp, sh, fd))
+tagDiag (w@(Reason warning), (nfp, sh, fd))
+#endif
   | Just tag <- requiresTag warning
-  = (Reason warning, (nfp, sh, fd { _tags = addTag tag (_tags fd) }))
+  = (w, (nfp, sh, fd { _tags = addTag tag (_tags fd) }))
   where
     requiresTag :: WarningFlag -> Maybe DiagnosticTag
     requiresTag Opt_WarnWarningsDeprecations
@@ -694,7 +803,12 @@ generateHieAsts hscEnv tcm =
         insts = tcg_insts ts :: [ClsInst]
         tcs = tcg_tcs ts :: [TyCon]
     run ts $
-      Just <$> GHC.enrichHie (fake_splice_binds `Util.unionBags` real_binds) (tmrRenamed tcm) top_ev_binds insts tcs
+#if MIN_VERSION_ghc(9,3,0)
+      pure $ Just $
+#else
+      Just <$>
+#endif
+          GHC.enrichHie (fake_splice_binds `Util.unionBags` real_binds) (tmrRenamed tcm) top_ev_binds insts tcs
 #else
     Just <$> GHC.enrichHie (fake_splice_binds `Util.unionBags` real_binds) (tmrRenamed tcm)
 #endif
@@ -702,7 +816,7 @@ generateHieAsts hscEnv tcm =
     dflags = hsc_dflags hscEnv
 #if MIN_VERSION_ghc(9,0,0)
     run ts =
-#if MIN_VERSION_ghc(9,2,0)
+#if MIN_VERSION_ghc(9,2,0) && !MIN_VERSION_ghc(9,3,0)
         fmap (join . snd) . liftIO . initDs hscEnv ts
 #else
         id
@@ -904,13 +1018,69 @@ loadModulesHome
     -> HscEnv
     -> HscEnv
 loadModulesHome mod_infos e =
+#if MIN_VERSION_ghc(9,3,0)
+  hscUpdateHUG (\hug -> foldr addHomeModInfoToHug hug mod_infos) (e { hsc_type_env_vars = emptyKnotVars })
+#else
   let !new_modules = addListToHpt (hsc_HPT e) [(mod_name x, x) | x <- mod_infos]
   in e { hsc_HPT = new_modules
-      , hsc_type_env_var = Nothing }
+       , hsc_type_env_var = Nothing
+       }
     where
       mod_name = moduleName . mi_module . hm_iface
+#endif
 
 -- Merge the HPTs, module graphs and FinderCaches
+#if MIN_VERSION_ghc(9,3,0)
+mergeEnvs :: HscEnv -> [ModuleGraphNode] -> [HomeModInfo] -> [HscEnv] -> IO HscEnv
+mergeEnvs env extraNodes extraMods envs = do
+    let extraModSummaries = mapMaybe moduleGraphNodeModSum extraNodes
+        ims  = map (\ms -> Compat.installedModule (toUnitId $ moduleUnit $ ms_mod ms)  (moduleName (ms_mod ms))) extraModSummaries
+        ifrs = zipWith (\ms -> InstalledFound (ms_location ms)) extraModSummaries ims
+        curFinderCache =
+            foldl'
+                (\fc (im, ifr) -> Compat.extendInstalledModuleEnv fc im ifr) Compat.emptyInstalledModuleEnv
+                $ zip ims ifrs
+        -- Very important to force this as otherwise the hsc_mod_graph field is not
+        -- forced and ends up retaining a reference to all the old hsc_envs we have merged to get
+        -- this new one, which in turn leads to the EPS referencing the HPT.
+        module_graph_nodes =
+          extraNodes ++ nubOrdOn mkNodeKey (concatMap (mgModSummaries' . hsc_mod_graph) envs)
+
+    newFinderCache <- concatFC curFinderCache (map hsc_FC envs)
+    liftRnf rwhnf module_graph_nodes `seq` (return $ loadModulesHome extraMods $
+      let newHug = logFold mergeHUG (hsc_HUG env : map hsc_HUG envs) in
+      trace ("MERGE ******************** " ++ printWithoutUniques (ue_home_unit_graph $ hsc_unit_env $ env, newHug))
+      (hscUpdateHUG (const newHug) env){
+          hsc_FC = newFinderCache,
+          hsc_mod_graph = mkModuleGraph module_graph_nodes
+      })
+
+    where
+        mergeHUG (UnitEnvGraph a) (UnitEnvGraph b) = UnitEnvGraph $ Map.unionWith mergeHUE a b
+        mergeHUE a b = a { homeUnitEnv_hpt = mergeUDFM (homeUnitEnv_hpt a) (homeUnitEnv_hpt b) }
+        mergeUDFM = plusUDFM_C combineModules
+
+        combineModules a b
+          | HsSrcFile <- mi_hsc_src (hm_iface a) = a
+          | otherwise = b
+        concatFC :: FinderCacheState -> [FinderCache] -> IO FinderCache
+        concatFC cur xs = do
+          fcModules <- mapM (readIORef . fcModuleCache) xs
+          fcFiles <- mapM (readIORef . fcFileCache) xs
+          fcModules' <- newIORef (logFold (plusInstalledModuleEnv const) (cur : fcModules))
+          fcFiles' <- newIORef (Map.unions fcFiles)
+          pure $ FinderCache fcModules' fcFiles'
+
+        logFold :: (a -> a -> a) -> [a] -> a
+        logFold f = go
+          where
+            go []  = error "need one element"
+            go [x] = x
+            go xs = go (goPairs xs)
+
+            goPairs (x:y:xs) = let !a = f x y in a : goPairs xs
+            goPairs xs = xs
+#else
 mergeEnvs :: HscEnv -> [ModSummary] -> [HomeModInfo] -> [HscEnv] -> IO HscEnv
 mergeEnvs env extraModSummaries extraMods envs = do
     prevFinderCache <- concatFC <$> mapM (readIORef . hsc_FC) envs
@@ -932,11 +1102,13 @@ mergeEnvs env extraModSummaries extraMods envs = do
             foldl'
                 (\fc (im, ifr) -> Compat.extendInstalledModuleEnv fc im ifr) prevFinderCache
                 $ zip ims ifrs
-    liftRnf rwhnf module_graph_nodes `seq` (return $ loadModulesHome extraMods $ env{
-        hsc_HPT = foldMapBy mergeUDFM emptyUDFM hsc_HPT envs,
-        hsc_FC = newFinderCache,
-        hsc_mod_graph = mkModuleGraph module_graph_nodes
-    })
+    liftRnf rwhnf module_graph_nodes `seq` (return $ loadModulesHome extraMods $
+      env{
+          hsc_HPT = foldMapBy mergeUDFM emptyUDFM hsc_HPT envs,
+          hsc_FC = newFinderCache,
+          hsc_mod_graph = mkModuleGraph module_graph_nodes
+      })
+
     where
         mergeUDFM = plusUDFM_C combineModules
         combineModules a b
@@ -949,6 +1121,7 @@ mergeEnvs env extraModSummaries extraMods envs = do
     -- To remove this, I plan to upstream the missing Monoid instance
         concatFC :: [FinderCache] -> FinderCache
         concatFC = unsafeCoerce (mconcat @(Map InstalledModule InstalledFindResult))
+#endif
 
 withBootSuffix :: HscSource -> ModLocation -> ModLocation
 withBootSuffix HsBootFile = addBootSuffixLocnOut
@@ -985,17 +1158,34 @@ getModSummaryFromImports env fp modTime contents = do
         implicit_imports = mkPrelImports mod main_loc
                                          implicit_prelude imps
 
-        convImport (L _ i) = (fmap sl_fs (ideclPkgQual i)
-                                         , reLoc $ ideclName i)
 
-        srcImports = map convImport src_idecls
-        textualImports = map convImport (implicit_imports ++ ordinary_imps)
+        convImport (L _ i) = (
+#if !MIN_VERSION_ghc (9,3,0)
+                               fmap sl_fs
+#endif
+                               (ideclPkgQual i)
+                             , reLoc $ ideclName i)
 
         msrImports = implicit_imports ++ imps
+
+#if MIN_VERSION_ghc (9,3,0)
+        rn_pkg_qual = renameRawPkgQual (hsc_unit_env env)
+        rn_imps = fmap (\(pk, lmn@(L _ mn)) -> (rn_pkg_qual mn pk, lmn))
+        srcImports = rn_imps $ map convImport src_idecls
+        textualImports = rn_imps $ map convImport (implicit_imports ++ ordinary_imps)
+#else
+        srcImports = map convImport src_idecls
+        textualImports = map convImport (implicit_imports ++ ordinary_imps)
+#endif
+
 
     -- Force bits that might keep the string buffer and DynFlags alive unnecessarily
     liftIO $ evaluate $ rnf srcImports
     liftIO $ evaluate $ rnf textualImports
+
+#if MIN_VERSION_ghc (9,3,0)
+    !src_hash <- liftIO $ fingerprintFromStringBuffer contents
+#endif
 
     modLoc <- liftIO $ if mod == mAIN_NAME
         -- specially in tests it's common to have lots of nameless modules
@@ -1011,7 +1201,13 @@ getModSummaryFromImports env fp modTime contents = do
 #if MIN_VERSION_ghc(8,8,0)
                 , ms_hie_date     = Nothing
 #endif
+#if MIN_VERSION_ghc(9,3,0)
+                , ms_dyn_obj_date    = Nothing
+                , ms_ghc_prim_import = False -- TODO wz1000
+                , ms_hs_hash      = src_hash
+#else
                 , ms_hs_date      = modTime
+#endif
                 , ms_hsc_src      = sourceType
                 -- The contents are used by the GetModSummary rule
                 , ms_hspp_buf     = Just contents
@@ -1035,7 +1231,14 @@ getModSummaryFromImports env fp modTime contents = do
                   put $ Util.uniq $ moduleNameFS $ moduleName ms_mod
                   forM_ (ms_srcimps ++ ms_textual_imps) $ \(mb_p, m) -> do
                     put $ Util.uniq $ moduleNameFS $ unLoc m
+#if MIN_VERSION_ghc(9,3,0)
+                    case mb_p of
+                      G.NoPkgQual -> pure ()
+                      G.ThisPkg uid  -> put $ getKey $ getUnique uid
+                      G.OtherPkg uid -> put $ getKey $ getUnique uid
+#else
                     whenJust mb_p $ put . Util.uniq
+#endif
             return $! Util.fingerprintFingerprints $
                     [ Util.fingerprintString fp
                     , fingerPrintImports
@@ -1129,7 +1332,12 @@ parseFileContents env customPreprocessor filename ms = do
                --   - filter out the .hs/.lhs source filename if we have one
                --
                let n_hspp  = normalise filename
-                   srcs0 = nubOrd $ filter (not . (tmpDir dflags `isPrefixOf`))
+#if MIN_VERSION_ghc(9,3,0)
+                   TempDir tmp_dir = tmpDir dflags
+#else
+                   tmp_dir = tmpDir dflags
+#endif
+                   srcs0 = nubOrd $ filter (not . (tmp_dir `isPrefixOf`))
                                   $ filter (/= n_hspp)
                                   $ map normalise
                                   $ filter (not . isPrefixOf "<")
@@ -1271,7 +1479,13 @@ loadInterface session ms linkableNeeded RecompilationInfo{..} = do
     -- If mb_old_iface is nothing then checkOldIface will load it for us
     -- given that the source is unmodified
     (recomp_iface_reqd, mb_checked_iface)
+#if MIN_VERSION_ghc(9,3,0)
+      <- liftIO $ checkOldIface sessionWithMsDynFlags ms mb_old_iface >>= \case
+        UpToDateItem x -> pure (UpToDate, Just x)
+        OutOfDateItem reason x -> pure (NeedsRecompile reason, x)
+#else
       <- liftIO $ checkOldIface sessionWithMsDynFlags ms sourceMod mb_old_iface
+#endif
 
     let do_regenerate _reason = withTrace "regenerate interface" $ \setTag -> do
           setTag "Module" $ moduleNameString $ moduleName mod
@@ -1308,14 +1522,14 @@ loadInterface session ms linkableNeeded RecompilationInfo{..} = do
                      readBinCoreFile (mkUpdater $ hsc_NC session) core_file
                    if cf_iface_hash == getModuleHash iface
                    then return ([], Just $ mkHiFileResult ms iface details runtime_deps (Just (core_file, fingerprintToBS core_hash)))
-                   else do_regenerate (RecompBecause "Core file out of date (doesn't match iface hash)")
+                   else do_regenerate (recompBecause "Core file out of date (doesn't match iface hash)")
                  | otherwise -> return ([], Just $ mkHiFileResult ms iface details runtime_deps Nothing)
                  where handleErrs = flip catches
-                         [Handler $ \(e :: IOException) -> do_regenerate (RecompBecause $ "Reading core file failed (" ++ show e ++ ")")
+                         [Handler $ \(e :: IOException) -> do_regenerate (recompBecause $ "Reading core file failed (" ++ show e ++ ")")
                          ,Handler $ \(e :: GhcException) -> case e of
                             Signal _ -> throw e
                             Panic _  -> throw e
-                            _        -> do_regenerate (RecompBecause $ "Reading core file failed (" ++ show e ++ ")")
+                            _        -> do_regenerate (recompBecause $ "Reading core file failed (" ++ show e ++ ")")
                          ]
       (_, _reason) -> do_regenerate _reason
 
@@ -1350,18 +1564,40 @@ checkLinkableDependencies get_linkable_hashes graph runtime_deps = do
       let out_of_date = [core_file | ((core_file, expected_hash), actual_hash) <- zip fs store_hashes, expected_hash /= actual_hash]
       case out_of_date of
         [] -> pure Nothing
-        _ -> pure $ Just $
-          RecompBecause $ "out of date runtime dependencies: " ++ intercalate ", " (map show out_of_date)
+        _ -> pure $ Just $ recompBecause
+              $ "out of date runtime dependencies: " ++ intercalate ", " (map show out_of_date)
+
+recompBecause =
+#if MIN_VERSION_ghc(9,3,0)
+                NeedsRecompile .
+#endif
+                RecompBecause
+#if MIN_VERSION_ghc(9,3,0)
+              . CustomReason
+#endif
+
+#if MIN_VERSION_ghc(9,3,0)
+data SourceModified = SourceModified | SourceUnmodified deriving (Eq, Ord, Show)
+#endif
 
 showReason :: RecompileRequired -> String
 showReason UpToDate          = "UpToDate"
+#if MIN_VERSION_ghc(9,3,0)
+showReason (NeedsRecompile MustCompile)    = "MustCompile"
+showReason (NeedsRecompile s) = printWithoutUniques s
+#else
 showReason MustCompile       = "MustCompile"
 showReason (RecompBecause s) = s
+#endif
 
 mkDetailsFromIface :: HscEnv -> ModIface -> IO ModDetails
 mkDetailsFromIface session iface = do
   fixIO $ \details -> do
+#if MIN_VERSION_ghc(9,3,0)
+    let hsc' = hscUpdateHPT (\hpt -> addToHpt hpt (moduleName $ mi_module iface) (HomeModInfo iface details Nothing)) session
+#else
     let hsc' = session { hsc_HPT = addToHpt (hsc_HPT session) (moduleName $ mi_module iface) (HomeModInfo iface details Nothing) }
+#endif
     initIfaceLoad hsc' (typecheckIface iface)
 
 coreFileToCgGuts :: HscEnv -> ModIface -> ModDetails -> CoreFile -> IO CgGuts
@@ -1370,28 +1606,27 @@ coreFileToCgGuts session iface details core_file = do
                              (HomeModInfo iface details Nothing)
       this_mod = mi_module iface
   types_var <- newIORef (md_types details)
+#if MIN_VERSION_ghc(9,3,0)
+  let hsc_env' = hscUpdateHPT act (session {hsc_type_env_vars = knotVarsFromModuleEnv (mkModuleEnv [(this_mod, types_var)])})
+#else
   let kv = Just (this_mod, types_var)
       hsc_env' = session { hsc_HPT = act (hsc_HPT session)
-                         , hsc_type_env_var = kv }
+                         , hsc_type_env_var = kv
+                         }
+#endif
   core_binds <- initIfaceCheck (text "l") hsc_env' $ typecheckCoreFile this_mod types_var core_file
       -- Implicit binds aren't saved, so we need to regenerate them ourselves.
   let implicit_binds = concatMap getImplicitBinds tyCons
       tyCons = typeEnvTyCons (md_types details)
+#if MIN_VERSION_ghc(9,3,0)
+  pure $ CgGuts this_mod tyCons (implicit_binds ++ core_binds) [] NoStubs [] mempty (emptyHpcInfo False) Nothing []
+#else
   pure $ CgGuts this_mod tyCons (implicit_binds ++ core_binds) NoStubs [] [] (emptyHpcInfo False) Nothing []
+#endif
 
 coreFileToLinkable :: LinkableType -> HscEnv -> ModSummary -> ModIface -> ModDetails -> CoreFile -> UTCTime -> IO ([FileDiagnostic], Maybe HomeModInfo)
 coreFileToLinkable linkableType session ms iface details core_file t = do
-  let act hpt = addToHpt hpt (moduleName this_mod)
-                             (HomeModInfo iface details Nothing)
-      this_mod = mi_module iface
-  types_var <- newIORef (md_types details)
-  let kv = Just (this_mod, types_var)
-      hsc_env' = session { hsc_HPT = act (hsc_HPT session)
-                         , hsc_type_env_var = kv }
-  core_binds <- initIfaceCheck (text "l") hsc_env' $ typecheckCoreFile this_mod types_var core_file
-  let implicit_binds = concatMap getImplicitBinds tyCons
-      tyCons = typeEnvTyCons (md_types details)
-  let cgi_guts = CgGuts this_mod tyCons (implicit_binds ++ core_binds) NoStubs [] [] (emptyHpcInfo False) Nothing []
+  cgi_guts <- coreFileToCgGuts session iface details core_file
   (warns, lb) <- case linkableType of
     BCOLinkable -> generateByteCode (CoreFileTime t) session ms cgi_guts
     ObjectLinkable -> generateObjectCode session ms cgi_guts
@@ -1404,27 +1639,55 @@ getDocsBatch
   :: HscEnv
   -> Module  -- ^ a moudle where the names are in scope
   -> [Name]
+#if MIN_VERSION_ghc(9,3,0)
+  -> IO [Either String (Maybe [HsDoc GhcRn], IntMap (HsDoc GhcRn))]
+#else
   -> IO [Either String (Maybe HsDocString, IntMap HsDocString)]
+#endif
 getDocsBatch hsc_env _mod _names = do
     (msgs, res) <- initTc hsc_env HsSrcFile False _mod fakeSpan $ forM _names $ \name ->
         case nameModule_maybe name of
             Nothing -> return (Left $ NameHasNoModule name)
             Just mod -> do
-             ModIface { mi_doc_hdr = mb_doc_hdr
+             ModIface {
+#if MIN_VERSION_ghc(9,3,0)
+                        mi_docs = Just Docs{ docs_mod_hdr = mb_doc_hdr
+                                      , docs_decls = dmap
+                                      , docs_args = amap
+                                      }
+#else
+                        mi_doc_hdr = mb_doc_hdr
                       , mi_decl_docs = DeclDocMap dmap
                       , mi_arg_docs = ArgDocMap amap
+#endif
                       } <- loadModuleInterface "getModuleInterface" mod
+#if MIN_VERSION_ghc(9,3,0)
+             if isNothing mb_doc_hdr && isNullUniqMap dmap && isNullUniqMap amap
+#else
              if isNothing mb_doc_hdr && Map.null dmap && null amap
+#endif
                then pure (Left (NoDocsInIface mod $ compiled name))
-               else pure (Right ( Map.lookup name dmap ,
+               else pure (Right (
+#if MIN_VERSION_ghc(9,3,0)
+                                  lookupUniqMap dmap name,
+#else
+                                  Map.lookup name dmap ,
+#endif
 #if !MIN_VERSION_ghc(9,2,0)
                                   IntMap.fromAscList $ Map.toAscList $
 #endif
+#if MIN_VERSION_ghc(9,3,0)
+                                  lookupWithDefaultUniqMap amap mempty name))
+#else
                                   Map.findWithDefault mempty name amap))
+#endif
     case res of
-        Just x  -> return $ map (first $ T.unpack . printOutputable) x
+        Just x  -> return $ map (first $ T.unpack . printOutputable)
+                          $ x
         Nothing -> throwErrors
-#if MIN_VERSION_ghc(9,2,0)
+#if MIN_VERSION_ghc(9,3,0)
+                     $ fmap GhcTcRnMessage msgs
+#elif MIN_VERSION_ghc(9,2,0)
                      $ Error.getErrorMessages msgs
 #else
                      $ snd msgs

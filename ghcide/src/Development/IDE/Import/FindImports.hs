@@ -27,6 +27,9 @@ import           Control.Monad.IO.Class
 import           Data.List                         (isSuffixOf)
 import           Data.Maybe
 import           System.FilePath
+#if MIN_VERSION_ghc(9,3,0)
+import GHC.Types.PkgQual
+#endif
 
 data Import
   = FileImport !ArtifactsLocation
@@ -81,8 +84,13 @@ locateModuleFile import_dirss exts targetFor isSource modName = do
 -- It only returns Just for unit-ids which are possible to import into the
 -- current module. In particular, it will return Nothing for 'main' components
 -- as they can never be imported into another package.
+#if MIN_VERSION_ghc(9,3,0)
+mkImportDirs :: HscEnv -> (UnitId, DynFlags) -> Maybe (UnitId, [FilePath])
+mkImportDirs env (i, flags) = Just (i, importPaths flags)
+#else
 mkImportDirs :: HscEnv -> (UnitId, DynFlags) -> Maybe (PackageName, [FilePath])
 mkImportDirs env (i, flags) = (, importPaths flags) <$> getUnitName env i
+#endif
 
 -- | locate a module in either the file system or the package database. Where we go from *daml to
 -- Haskell
@@ -93,20 +101,37 @@ locateModule
     -> [String]                        -- ^ File extensions
     -> (ModuleName -> NormalizedFilePath -> m (Maybe NormalizedFilePath))  -- ^ does file exist predicate
     -> Located ModuleName              -- ^ Module name
+#if MIN_VERSION_ghc(9,3,0)
+    -> PkgQual                -- ^ Package name
+#else
     -> Maybe FastString                -- ^ Package name
+#endif
     -> Bool                            -- ^ Is boot module
     -> m (Either [FileDiagnostic] Import)
 locateModule env comp_info exts targetFor modName mbPkgName isSource = do
   case mbPkgName of
     -- "this" means that we should only look in the current package
+#if MIN_VERSION_ghc(9,3,0)
+    ThisPkg _ -> do
+#else
     Just "this" -> do
+#endif
       lookupLocal [importPaths dflags]
     -- if a package name is given we only go look for a package
+#if MIN_VERSION_ghc(9,3,0)
+    OtherPkg uid
+      | Just dirs <- lookup uid import_paths
+#else
     Just pkgName
       | Just dirs <- lookup (PackageName pkgName) import_paths
+#endif
           -> lookupLocal [dirs]
       | otherwise -> lookupInPackageDB env
+#if MIN_VERSION_ghc(9,3,0)
+    NoPkgQual -> do
+#else
     Nothing -> do
+#endif
       -- first try to find the module as a file. If we can't find it try to find it in the package
       -- database.
       -- Here the importPaths for the current modules are added to the front of the import paths from the other components.
@@ -129,7 +154,7 @@ locateModule env comp_info exts targetFor modName mbPkgName isSource = do
         Nothing   -> return $ Left $ notFoundErr env modName $ LookupNotFound []
         Just file -> toModLocation file
 
-    lookupInPackageDB env =
+    lookupInPackageDB env = do
       case Compat.lookupModuleWithSuggestions env (unLoc modName) mbPkgName of
         LookupFound _m _pkgConfig -> return $ Right PackageImport
         reason -> return $ Left $ notFoundErr env modName reason

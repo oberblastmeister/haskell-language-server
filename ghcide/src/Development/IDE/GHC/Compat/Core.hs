@@ -2,6 +2,7 @@
 {-# LANGUAGE ConstraintKinds   #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE PatternSynonyms   #-}
+{-# LANGUAGE ViewPatterns   #-}
 -- TODO: remove
 {-# OPTIONS -Wno-dodgy-imports -Wno-unused-imports #-}
 
@@ -61,7 +62,9 @@ module Development.IDE.GHC.Compat.Core (
     pattern ExposePackage,
     parseDynamicFlagsCmdLine,
     parseDynamicFilePragma,
+#if !MIN_VERSION_ghc(9,3,0)
     WarnReason(..),
+#endif
     wWarningFlags,
     updOptLevel,
     -- slightly unsafe
@@ -84,7 +87,9 @@ module Development.IDE.GHC.Compat.Core (
     HscSource(..),
     WhereFrom(..),
     loadInterface,
+#if !MIN_VERSION_ghc(9,3,0)
     SourceModified(..),
+#endif
     loadModuleInterface,
     RecompileRequired(..),
 #if MIN_VERSION_ghc(8,10,0)
@@ -293,7 +298,6 @@ module Development.IDE.GHC.Compat.Core (
     Warn(..),
     -- * ModLocation
     GHC.ModLocation,
-    pattern ModLocation,
     Module.ml_hs_file,
     Module.ml_obj_file,
     Module.ml_hi_file,
@@ -480,6 +484,9 @@ import qualified GHC.Core.DataCon             as DataCon
 import           GHC.Core.FamInstEnv          hiding (pprFamInst)
 import           GHC.Core.InstEnv
 import           GHC.Types.Unique.FM
+#if MIN_VERSION_ghc(9,3,0)
+import qualified GHC.Data.Strict              as Strict
+#endif
 #if MIN_VERSION_ghc(9,2,0)
 import           GHC.Data.Bag
 import           GHC.Core.Multiplicity        (scaledThing)
@@ -501,7 +508,7 @@ import           GHC.Core.Utils
 #if MIN_VERSION_ghc(9,2,0)
 import           GHC.Driver.Env
 #else
-import           GHC.Driver.Finder
+import           GHC.Driver.Finder hiding     (mkHomeModLocation)
 import           GHC.Driver.Types
 import           GHC.Driver.Ways
 #endif
@@ -583,7 +590,10 @@ import qualified GHC.Types.Name.Reader        as RdrName
 #if MIN_VERSION_ghc(9,2,0)
 import           GHC.Types.Name.Set
 import           GHC.Types.SourceFile         (HscSource (..),
-                                               SourceModified (..))
+#if !MIN_VERSION_ghc(9,3,0)
+                                               SourceModified(..)
+#endif
+                                               )
 import           GHC.Types.SourceText
 import           GHC.Types.Target             (Target (..), TargetId (..))
 import           GHC.Types.TyThing
@@ -599,7 +609,7 @@ import           GHC.Types.Unique.Supply
 import           GHC.Types.Var                (Var (varName), setTyVarUnique,
                                                setVarUnique)
 #if MIN_VERSION_ghc(9,2,0)
-import           GHC.Unit.Finder
+import           GHC.Unit.Finder              hiding (mkHomeModLocation)
 import           GHC.Unit.Home.ModInfo
 #endif
 import           GHC.Unit.Info                (PackageName (..))
@@ -639,7 +649,7 @@ import           ErrUtils                     hiding (logInfo, mkWarnMsg)
 import           ExtractDocs
 import           FamInst
 import           FamInstEnv
-import           Finder
+import           Finder                       hiding (mkHomeModLocation)
 #if MIN_VERSION_ghc(8,10,0)
 import           GHC.Hs                       hiding (HsLet, LetStmt)
 #endif
@@ -744,14 +754,48 @@ import           System.FilePath
 #if MIN_VERSION_ghc(9,2,0)
 import           Language.Haskell.Syntax hiding (FunDep)
 #endif
+#if MIN_VERSION_ghc(9,3,0)
+import GHC.Driver.Env as GHCi
+#endif
+
+import Data.Foldable (toList)
+
+#if MIN_VERSION_ghc(9,3,0)
+import qualified GHC.Unit.Finder as GHC
+import qualified GHC.Driver.Config.Finder as GHC
+#elif MIN_VERSION_ghc(9,2,0)
+import qualified GHC.Unit.Finder as GHC
+#elif MIN_VERSION_ghc(9,0,0)
+import qualified GHC.Driver.Finder as GHC
+#else
+import qualified Finder as GHC
+#endif
+
+
+mkHomeModLocation :: DynFlags -> ModuleName -> FilePath -> IO Module.ModLocation
+#if MIN_VERSION_ghc(9,3,0)
+mkHomeModLocation df mn f = pure $ GHC.mkHomeModLocation (GHC.initFinderOpts df) mn f
+#else
+mkHomeModLocation = GHC.mkHomeModLocation
+#endif
+
 
 #if !MIN_VERSION_ghc(9,0,0)
 type BufSpan = ()
 type BufPos = ()
 #endif
 
+#if MIN_VERSION_ghc(9,3,0)
 pattern RealSrcSpan :: SrcLoc.RealSrcSpan -> Maybe BufSpan -> SrcLoc.SrcSpan
-#if MIN_VERSION_ghc(9,0,0)
+#else
+pattern RealSrcSpan :: SrcLoc.RealSrcSpan -> Maybe BufSpan -> SrcLoc.SrcSpan
+#endif
+
+#if MIN_VERSION_ghc(9,3,0)
+pattern RealSrcSpan x y <- SrcLoc.RealSrcSpan x ((\case Strict.Nothing -> Nothing; Strict.Just a -> Just a) -> y) where
+  RealSrcSpan x y = SrcLoc.RealSrcSpan x (case y of Nothing -> Strict.Nothing; Just a -> Strict.Just a)
+
+#elif MIN_VERSION_ghc(9,0,0)
 pattern RealSrcSpan x y = SrcLoc.RealSrcSpan x y
 #else
 pattern RealSrcSpan x y <- ((,Nothing) -> (SrcLoc.RealSrcSpan x, y)) where
@@ -759,7 +803,11 @@ pattern RealSrcSpan x y <- ((,Nothing) -> (SrcLoc.RealSrcSpan x, y)) where
 #endif
 {-# COMPLETE RealSrcSpan, UnhelpfulSpan #-}
 
+#if MIN_VERSION_ghc(9,3,0)
+pattern RealSrcLoc :: SrcLoc.RealSrcLoc -> Strict.Maybe BufPos-> SrcLoc.SrcLoc
+#else
 pattern RealSrcLoc :: SrcLoc.RealSrcLoc -> Maybe BufPos-> SrcLoc.SrcLoc
+#endif
 #if MIN_VERSION_ghc(9,0,0)
 pattern RealSrcLoc x y = SrcLoc.RealSrcLoc x y
 #else
@@ -930,14 +978,6 @@ tcSplitForAllTyVarBinder_maybe =
   tcSplitForAllTy_maybe
 #endif
 
-pattern ModLocation :: Maybe FilePath -> FilePath -> FilePath -> GHC.ModLocation
-#if MIN_VERSION_ghc(8,8,0)
-pattern ModLocation a b c <-
-    GHC.ModLocation a b c _ where ModLocation a b c = GHC.ModLocation a b c ""
-#else
-pattern ModLocation a b c <-
-    GHC.ModLocation a b c where ModLocation a b c = GHC.ModLocation a b c
-#endif
 
 #if !MIN_VERSION_ghc(8,10,0)
 noExtField :: GHC.NoExt
@@ -1009,6 +1049,7 @@ unload hsc_env linkables =
 #endif
     hsc_env linkables
 
+#if !MIN_VERSION_ghc(9,3,0)
 setOutputFile :: FilePath -> DynFlags -> DynFlags
 setOutputFile f d = d {
 #if MIN_VERSION_ghc(9,2,0)
@@ -1017,6 +1058,7 @@ setOutputFile f d = d {
   outputFile     = Just f
 #endif
   }
+#endif
 
 isSubspanOfA :: LocatedAn la a -> LocatedAn lb b -> Bool
 #if MIN_VERSION_ghc(9,2,0)
@@ -1066,7 +1108,7 @@ pattern GRE :: Name -> Parent -> Bool -> [ImportSpec] -> RdrName.GlobalRdrElt
 #if MIN_VERSION_ghc(9,2,0)
 pattern GRE{gre_name, gre_par, gre_lcl, gre_imp} <- RdrName.GRE
     {gre_name = (greNamePrintableName -> gre_name)
-    ,gre_par, gre_lcl, gre_imp}
+    ,gre_par, gre_lcl, gre_imp = (toList -> gre_imp)}
 #else
 pattern GRE{gre_name, gre_par, gre_lcl, gre_imp} = RdrName.GRE{..}
 #endif

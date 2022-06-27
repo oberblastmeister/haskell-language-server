@@ -122,8 +122,16 @@ documentSymbolForDecl (L (locA -> (RealSrcSpan l _)) (TyClD _ DataDecl { tcdLNam
     }
   where
     cvtFld :: LFieldOcc GhcPs -> Maybe DocumentSymbol
+#if MIN_VERSION_ghc(9,3,0)
+    cvtFld (L (locA -> RealSrcSpan l _) n) = Just $ (defDocumentSymbol l :: DocumentSymbol)
+#else
     cvtFld (L (RealSrcSpan l _) n) = Just $ (defDocumentSymbol l :: DocumentSymbol)
+#endif
+#if MIN_VERSION_ghc(9,3,0)
+                { _name = printOutputable (unLoc (foLabel n))
+#else
                 { _name = printOutputable (unLoc (rdrNameFieldOcc n))
+#endif
                 , _kind = SkField
                 }
     cvtFld _  = Nothing
@@ -217,7 +225,7 @@ documentSymbolForImportSummary importSymbols =
     let
       -- safe because if we have no ranges then we don't take this branch
       mergeRanges xs = Range (minimum $ map _start xs) (maximum $ map _end xs)
-      importRange = mergeRanges $ map (_range :: DocumentSymbol -> Range) importSymbols
+      importRange = mergeRanges $ map (\DocumentSymbol{_range} -> _range) importSymbols
     in
       Just (defDocumentSymbol (rangeToRealSrcSpan "" importRange))
           { _name = "imports"
@@ -293,7 +301,11 @@ hsConDeclsBinders cons
 
     get_flds_gadt :: HsConDeclGADTDetails GhcPs
                   -> ([LFieldOcc GhcPs])
+#if MIN_VERSION_ghc(9,3,0)
+    get_flds_gadt (RecConGADT flds _) = get_flds (reLoc flds)
+#else
     get_flds_gadt (RecConGADT flds) = get_flds (reLoc flds)
+#endif
     get_flds_gadt _ = []
 
     get_flds :: Located [LConDeclField GhcPs]

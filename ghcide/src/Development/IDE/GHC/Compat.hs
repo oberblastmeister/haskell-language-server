@@ -9,12 +9,19 @@
 
 -- | Attempt at hiding the GHC version differences we can.
 module Development.IDE.GHC.Compat(
-    NameCacheUpdater(..),
+    mkHomeModLocation,
     hPutStringBuffer,
     addIncludePathsQuote,
     getModuleHash,
     setUpTypedHoles,
+    NameCacheUpdater(..),
+#if MIN_VERSION_ghc(9,3,0)
+    getMessages,
+    diagnosticMessage,
+    nameEnvElts,
+#else
     upNameCache,
+#endif
     disableWarningsAsErrors,
     reLoc,
     reLocA,
@@ -27,8 +34,10 @@ module Development.IDE.GHC.Compat(
 #endif
 
 #if MIN_VERSION_ghc(9,2,0)
+#if !MIN_VERSION_ghc(9,3,0)
     extendModSummaryNoDeps,
     emsModSummary,
+#endif
     myCoreToStgExpr,
 #endif
 
@@ -84,7 +93,11 @@ module Development.IDE.GHC.Compat(
     icInteractiveModule,
     HomePackageTable,
     lookupHpt,
+#if MIN_VERSION_ghc(9,3,0)
+    Dependencies(dep_direct_mods),
+#else
     Dependencies(dep_mods),
+#endif
     bcoFreeNames,
     ModIfaceAnnotation,
     pattern Annotation,
@@ -113,7 +126,7 @@ module Development.IDE.GHC.Compat(
 #endif
     ) where
 
-import           Development.IDE.GHC.Compat.Core
+import           Development.IDE.GHC.Compat.Core hiding (moduleUnitId)
 import           Development.IDE.GHC.Compat.Env
 import           Development.IDE.GHC.Compat.ExactPrint
 import           Development.IDE.GHC.Compat.Iface
@@ -139,7 +152,11 @@ import GHC.Core.Lint (lintInteractiveExpr)
 #if MIN_VERSION_ghc(9,2,0)
 import GHC.Unit.Home.ModInfo (lookupHpt, HomePackageTable)
 import GHC.Runtime.Context (icInteractiveModule)
+#if MIN_VERSION_ghc(9,3,0)
+import GHC.Unit.Module.Deps (Dependencies(dep_direct_mods))
+#else
 import GHC.Unit.Module.Deps (Dependencies(dep_mods))
+#endif
 import GHC.Linker.Types (isObjectLinkable)
 import GHC.Linker.Loader (loadExpr)
 #else
@@ -246,16 +263,37 @@ import GHC.Core.Utils
 import GHC.Types.Var.Env
 #endif
 
+#if MIN_VERSION_ghc(9,3,0)
+import GHC.Types.Error
+import GHC.Driver.Config.Stg.Pipeline
+#endif
+
 type ModIfaceAnnotation = Annotation
+
+#if MIN_VERSION_ghc(9,3,0)
+nameEnvElts :: NameEnv a -> [a]
+nameEnvElts = nonDetNameEnvElts
+#endif
 
 #if MIN_VERSION_ghc(9,2,0)
 myCoreToStgExpr :: Logger -> DynFlags -> InteractiveContext
+#if MIN_VERSION_ghc(9,3,0)
+            -> Bool
+#endif
                 -> Module -> ModLocation -> CoreExpr
                 -> IO ( Id
-                      , [StgTopBinding]
+#if MIN_VERSION_ghc(9,3,0)
+                      ,[CgStgTopBinding] -- output program
+#else
+                      ,[StgTopBinding] -- output program
+#endif
                       , InfoTableProvMap
                       , CollectedCCs )
-myCoreToStgExpr logger dflags ictxt this_mod ml prepd_expr = do
+myCoreToStgExpr logger dflags ictxt
+#if MIN_VERSION_ghc(9,3,0)
+                for_bytecode
+#endif
+                this_mod ml prepd_expr = do
     {- Create a temporary binding (just because myCoreToStg needs a
        binding for the stg2stg step) -}
     let bco_tmp_id = mkSysLocal (fsLit "BCO_toplevel")
@@ -266,24 +304,42 @@ myCoreToStgExpr logger dflags ictxt this_mod ml prepd_expr = do
        myCoreToStg logger
                    dflags
                    ictxt
+#if MIN_VERSION_ghc(9,3,0)
+                   for_bytecode
+#endif
                    this_mod
                    ml
                    [NonRec bco_tmp_id prepd_expr]
     return (bco_tmp_id, stg_binds, prov_map, collected_ccs)
 
 myCoreToStg :: Logger -> DynFlags -> InteractiveContext
+#if MIN_VERSION_ghc(9,3,0)
+            -> Bool
+#endif
             -> Module -> ModLocation -> CoreProgram
+#if MIN_VERSION_ghc(9,3,0)
+            -> IO ( [CgStgTopBinding] -- output program
+#else
             -> IO ( [StgTopBinding] -- output program
+#endif
                   , InfoTableProvMap
                   , CollectedCCs )  -- CAF cost centre info (declared and used)
-myCoreToStg logger dflags ictxt this_mod ml prepd_binds = do
+myCoreToStg logger dflags ictxt
+#if MIN_VERSION_ghc(9,3,0)
+            for_bytecode
+#endif
+            this_mod ml prepd_binds = do
     let (stg_binds, denv, cost_centre_info)
          = {-# SCC "Core2Stg" #-}
            coreToStg dflags this_mod ml prepd_binds
 
     stg_binds2
         <- {-# SCC "Stg2Stg" #-}
+#if MIN_VERSION_ghc(9,3,0)
+           stg2stg logger ictxt (initStgPipelineOpts dflags for_bytecode) this_mod stg_binds
+#else
            stg2stg logger dflags ictxt this_mod stg_binds
+#endif
 
     return (stg_binds2, denv, cost_centre_info)
 #endif
@@ -298,7 +354,9 @@ reLocA = id
 #endif
 
 getDependentMods :: ModIface -> [ModuleName]
-#if MIN_VERSION_ghc(9,0,0)
+#if MIN_VERSION_ghc(9,3,0)
+getDependentMods = map (gwib_mod . snd) . S.toList . dep_direct_mods . mi_deps
+#elif MIN_VERSION_ghc(9,0,0)
 getDependentMods = map gwib_mod . dep_mods . mi_deps
 #else
 getDependentMods = map fst . dep_mods . mi_deps
@@ -324,9 +382,15 @@ hPutStringBuffer hdl (StringBuffer buf len cur)
 #if MIN_VERSION_ghc(9,2,0)
 type ErrMsg  = MsgEnvelope DecoratedSDoc
 #endif
+#if MIN_VERSION_ghc(9,3,0)
+type WarnMsg  = MsgEnvelope DecoratedSDoc
+#endif
 
 getMessages' :: PState -> DynFlags -> (Bag WarnMsg, Bag ErrMsg)
 getMessages' pst dflags =
+#if MIN_VERSION_ghc(9,3,0)
+  bimap (fmap (fmap diagnosticMessage) . getMessages) (fmap (fmap diagnosticMessage) . getMessages) $ getPsMessages pst
+#else
 #if MIN_VERSION_ghc(9,2,0)
                  bimap (fmap pprWarning) (fmap pprError) $
 #endif
@@ -334,11 +398,16 @@ getMessages' pst dflags =
 #if !MIN_VERSION_ghc(9,2,0)
                    dflags
 #endif
+#endif
 
 #if MIN_VERSION_ghc(9,2,0)
 pattern PFailedWithErrorMessages :: forall a b. (b -> Bag (MsgEnvelope DecoratedSDoc)) -> ParseResult a
 pattern PFailedWithErrorMessages msgs
+#if MIN_VERSION_ghc(9,3,0)
+     <- PFailed (const . fmap (fmap diagnosticMessage) . getMessages . getPsErrorMessages -> msgs)
+#else
      <- PFailed (const . fmap pprError . getErrorMessages -> msgs)
+#endif
 #elif MIN_VERSION_ghc(8,10,0)
 pattern PFailedWithErrorMessages :: (DynFlags -> ErrorMessages) -> ParseResult a
 pattern PFailedWithErrorMessages msgs
@@ -359,13 +428,16 @@ supportsHieFiles = True
 hieExportNames :: HieFile -> [(SrcSpan, Name)]
 hieExportNames = nameListFromAvails . hie_exports
 
-
+#if MIN_VERSION_ghc(9,3,0)
+type NameCacheUpdater = NameCache
+#else
 upNameCache :: IORef NameCache -> (NameCache -> (NameCache, c)) -> IO c
 #if MIN_VERSION_ghc(8,8,0)
 upNameCache = updNameCache
 #else
 upNameCache ref upd_fn
   = atomicModifyIORef' ref upd_fn
+#endif
 #endif
 
 #if !MIN_VERSION_ghc(9,0,1)

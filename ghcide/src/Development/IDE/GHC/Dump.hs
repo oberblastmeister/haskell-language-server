@@ -21,7 +21,7 @@ import           GhcPlugins
 import           Prelude                         hiding ((<>))
 
 -- | Show a GHC syntax tree in HTML.
-#if MIN_VERSION_ghc(9,2,1)
+#if MIN_VERSION_ghc(9,2,1) && !MIN_VERSION_ghc(9,3,0)
 showAstDataHtml :: (Data a, ExactPrint a, Outputable a) => a -> SDoc
 #else
 showAstDataHtml :: (Data a, Outputable a) => a -> SDoc
@@ -30,12 +30,16 @@ showAstDataHtml a0 = html $
     header $$
     body (tag' [("id",text (show @String "myUL"))] "ul" $ vcat
         [
-#if MIN_VERSION_ghc(9,2,1)
+#if MIN_VERSION_ghc(9,2,1) && !MIN_VERSION_ghc(9,3,0)
             li (pre $ text (exactPrint a0)),
             li (showAstDataHtml' a0),
             li (nested "Raw" $ pre $ showAstData NoBlankSrcSpan NoBlankEpAnnotations a0)
 #else
-            li (nested "Raw" $ pre $ showAstData NoBlankSrcSpan a0)
+            li (nested "Raw" $ pre $ showAstData NoBlankSrcSpan
+#if MIN_VERSION_ghc(9,3,0)
+                                                 NoBlankEpAnnotations
+#endif
+                                                 a0)
 #endif
         ])
   where
@@ -48,7 +52,7 @@ showAstDataHtml a0 = html $
     li = tag "li"
     caret x = tag' [("class", text "caret")] "span" "" <+> x
     nested foo cts
-#if MIN_VERSION_ghc(9,2,1)
+#if MIN_VERSION_ghc(9,2,1) && !MIN_VERSION_ghc(9,3,0)
       | cts == empty = foo
 #endif
       | otherwise = foo $$ (caret $ ul cts)
@@ -56,7 +60,7 @@ showAstDataHtml a0 = html $
     header = tag "head" $ tag "style" $ text css
     html = tag "html"
     pre = tag "pre"
-#if MIN_VERSION_ghc(9,2,1)
+#if MIN_VERSION_ghc(9,2,1) && !MIN_VERSION_ghc(9,3,0)
     showAstDataHtml' :: Data a => a -> SDoc
     showAstDataHtml' =
       (generic

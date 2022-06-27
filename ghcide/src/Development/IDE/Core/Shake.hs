@@ -10,6 +10,7 @@
 {-# LANGUAGE RankNTypes                #-}
 {-# LANGUAGE RecursiveDo               #-}
 {-# LANGUAGE TypeFamilies              #-}
+{-# LANGUAGE CPP                       #-}
 
 -- | A Shake implementation of the compiler service.
 --
@@ -128,8 +129,11 @@ import           Development.IDE.GHC.Compat             (NameCache,
                                                          NameCacheUpdater (..),
                                                          initNameCache,
                                                          knownKeyNames,
-                                                         mkSplitUniqSupply,
-                                                         upNameCache)
+#if !MIN_VERSION_ghc(9,3,0)
+                                                         upNameCache,
+#endif
+                                                         mkSplitUniqSupply
+                                                         )
 import           Development.IDE.GHC.Orphans            ()
 import           Development.IDE.Graph                  hiding (ShakeValue)
 import qualified Development.IDE.Graph                  as Shake
@@ -260,7 +264,11 @@ data ShakeExtras = ShakeExtras
         -> String
         -> [DelayedAction ()]
         -> IO ()
+#if MIN_VERSION_ghc(9,3,0)
+    ,ideNc :: NameCache
+#else
     ,ideNc :: IORef NameCache
+#endif
     -- | A mapping of module name to known target (or candidate targets, if missing)
     ,knownTargetsVar :: TVar (Hashed KnownTargets)
     -- | A mapping of exported identifiers for local modules. Updated on kick
@@ -569,8 +577,12 @@ shakeOpen recorder lspEnv defaultConfig logger debouncer
     let log :: Logger.Priority -> Log -> IO ()
         log = logWith recorder
 
+#if MIN_VERSION_ghc(9,3,0)
+    ideNc <- initNameCache 'r' knownKeyNames
+#else
     us <- mkSplitUniqSupply 'r'
     ideNc <- newIORef (initNameCache us knownKeyNames)
+#endif
     shakeExtras <- do
         globals <- newTVarIO HMap.empty
         state <- STM.newIO
@@ -955,8 +967,14 @@ runIdeAction _herald s i = runReaderT (runIdeActionT i) s
 askShake :: IdeAction ShakeExtras
 askShake = ask
 
+
+#if MIN_VERSION_ghc(9,3,0)
+mkUpdater :: NameCache -> NameCacheUpdater
+mkUpdater = id
+#else
 mkUpdater :: IORef NameCache -> NameCacheUpdater
 mkUpdater ref = NCU (upNameCache ref)
+#endif
 
 -- | A (maybe) stale result now, and an up to date one later
 data FastResult a = FastResult { stale :: Maybe (a,PositionMapping), uptoDate :: IO (Maybe a)  }

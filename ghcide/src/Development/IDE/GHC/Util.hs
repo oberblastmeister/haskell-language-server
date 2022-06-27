@@ -33,7 +33,7 @@ module Development.IDE.GHC.Util(
 #if MIN_VERSION_ghc(9,2,0)
 import           GHC.Data.FastString
 import           GHC.Data.StringBuffer
-import           GHC.Driver.Env
+import           GHC.Driver.Env                    hiding (hscSetFlags)
 import           GHC.Driver.Monad
 import           GHC.Driver.Session                hiding (ExposePackage)
 import           GHC.Parser.Lexer
@@ -289,7 +289,11 @@ debugAST :: Bool
 debugAST = unsafePerformIO (getEnvDefault "GHCIDE_DEBUG_AST" "0") == "1"
 
 -- | Prints an 'Outputable' value to stderr and to an HTML file for further inspection
+#if MIN_VERSION_ghc(9,3,0)
+traceAst :: (Data a, Outputable a, HasCallStack) => String -> a -> a
+#else
 traceAst :: (Data a, ExactPrint a, Outputable a, HasCallStack) => String -> a -> a
+#endif
 traceAst lbl x
   | debugAST = trace doTrace x
   | otherwise = x
@@ -306,7 +310,7 @@ traceAst lbl x
         writeFile htmlDumpFileName $ renderDump htmlDump
         return $ unlines
             [prettyCallStack callStack ++ ":"
-#if MIN_VERSION_ghc(9,2,0)
+#if MIN_VERSION_ghc(9,2,0) && !MIN_VERSION_ghc(9,3,0)
             , exactPrint x
 #endif
             , "file://" ++ htmlDumpFileName]

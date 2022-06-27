@@ -157,6 +157,11 @@ import qualified Development.IDE.Types.Shake as Shake
 import           Development.IDE.GHC.CoreFile
 import           Data.Time.Clock.POSIX             (posixSecondsToUTCTime, utcTimeToPOSIXSeconds)
 import Control.Monad.IO.Unlift
+#if MIN_VERSION_ghc(9,3,0)
+import GHC.Unit.Module.Graph
+import GHC.Unit.Env
+#endif
+import Debug.Trace
 
 data Log
   = LogShake Shake.Log
@@ -164,7 +169,9 @@ data Log
   | LogLoadingHieFile !NormalizedFilePath
   | LogLoadingHieFileFail !FilePath !SomeException
   | LogLoadingHieFileSuccess !FilePath
+#if !MIN_VERSION_ghc(9,3,0)
   | LogExactPrint ExactPrint.Log
+#endif
   deriving Show
 
 instance Pretty Log where
@@ -181,7 +188,9 @@ instance Pretty Log where
           , pretty (displayException e) ]
     LogLoadingHieFileSuccess path ->
       "SUCCEEDED LOADING HIE FILE FOR" <+> pretty path
+#if !MIN_VERSION_ghc(9,3,0)
     LogExactPrint log -> pretty log
+#endif
 
 templateHaskellInstructions :: T.Text
 templateHaskellInstructions = "https://haskell-language-server.readthedocs.io/en/latest/troubleshooting.html#static-binaries"
@@ -758,9 +767,21 @@ ghcSessionDepsDefinition fullModSummary GhcSessionDepsConfig{..} env file = do
 
             depSessions <- map hscEnv <$> uses_ (GhcSessionDeps_ fullModSummary) deps
             ifaces <- uses_ GetModIface deps
-
-            let            inLoadOrder = map (\HiFileResult{..} -> HomeModInfo hirModIface hirModDetails Nothing) ifaces
-            session' <- liftIO $ mergeEnvs hsc mss inLoadOrder depSessions
+            let inLoadOrder = map (\HiFileResult{..} -> HomeModInfo hirModIface hirModDetails Nothing) ifaces
+#if MIN_VERSION_ghc(9,3,0)
+            mss_imports <- uses_ GetLocatedImports (file : deps)
+            final_deps <- forM mss_imports $ \imports -> do
+              let fs = mapMaybe (fmap artifactFilePath . snd) imports
+              dep_mss <- map msrModSummary <$> if fullModSummary
+                    then uses_ GetModSummary fs
+                    else uses_ GetModSummaryWithoutTimestamps fs
+              return (map (NodeKey_Module . msKey) dep_mss)
+            ms <- msrModSummary <$> use_ GetModSummary file
+            let moduleNodes = zipWith ModuleNode final_deps (ms : mss)
+#else
+            let moduleNodes = mss
+#endif
+            session' <- liftIO $ mergeEnvs hsc moduleNodes inLoadOrder depSessions
 
             Just <$> liftIO (newHscEnvEqWithImportPaths (envImportPaths env) session' [])
 
@@ -866,8 +887,12 @@ getModSummaryRule displayTHWarning recorder = do
                 when (uses_th_qq $ msrModSummary res) $ do
                     DisplayTHWarning act <- getIdeGlobalAction
                     liftIO act
+#if MIN_VERSION_ghc(9,3,0)
+                let bufFingerPrint = ms_hs_hash (msrModSummary res)
+#else
                 bufFingerPrint <- liftIO $
                     fingerprintFromStringBuffer $ fromJust $ ms_hspp_buf $ msrModSummary res
+#endif
                 let fingerPrint = Util.fingerprintFingerprints
                         [ msrFingerprint res, bufFingerPrint ]
                 return ( Just (fingerprintToBS fingerPrint) , ([], Just res))
@@ -878,7 +903,9 @@ getModSummaryRule displayTHWarning recorder = do
         case ms of
             Just res@ModSummaryResult{..} -> do
                 let ms = msrModSummary {
+#if !MIN_VERSION_ghc(9,3,0)
                     ms_hs_date = error "use GetModSummary instead of GetModSummaryWithoutTimestamps",
+#endif
                     ms_hspp_buf = error "use GetModSummary instead of GetModSummaryWithoutTimestamps"
                     }
                     fp = fingerprintToBS msrFingerprint
@@ -1212,7 +1239,9 @@ mainRule recorder RulesConfig{..} = do
       else defineNoDiagnostics (cmapWithPrio LogShake recorder) $ \NeedsCompilation _ -> return $ Just Nothing
     generateCoreRule recorder
     getImportMapRule recorder
+#if !MIN_VERSION_ghc(9,3,0)
     getAnnotatedParsedSourceRule (cmapWithPrio LogExactPrint recorder)
+#endif
     persistentHieFileRule recorder
     persistentDocMapRule
     persistentImportMapRule

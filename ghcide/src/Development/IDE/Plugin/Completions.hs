@@ -26,7 +26,9 @@ import           Development.IDE.Core.Shake                   hiding (Log)
 import qualified Development.IDE.Core.Shake                   as Shake
 import           Development.IDE.GHC.Compat
 import           Development.IDE.GHC.Error                    (rangeToSrcSpan)
+#if !MIN_VERSION_ghc(9,3,0)
 import           Development.IDE.GHC.ExactPrint               (GetAnnotatedParsedSource (GetAnnotatedParsedSource))
+#endif
 import           Development.IDE.GHC.Util                     (printOutputable)
 import           Development.IDE.Graph
 import           Development.IDE.Plugin.CodeAction            (newImport,
@@ -228,7 +230,11 @@ extendImportHandler' ideState ExtendImport {..}
           runMaybeT $ do
             -- We want accurate edits, so do not use stale data here
             msr <- MaybeT $ use GetModSummaryWithoutTimestamps nfp
+#if !MIN_VERSION_ghc(9,3,0)
             ps <- MaybeT $ use GetAnnotatedParsedSource nfp
+#else
+            ps <- pm_parsed_source <$> (MaybeT $ use GetParsedModule nfp)
+#endif
             (_, contents) <- MaybeT $ use GetFileContents nfp
             return (msr, ps, contents)
       let df = ms_hspp_opts msrModSummary
@@ -238,12 +244,16 @@ extendImportHandler' ideState ExtendImport {..}
       case existingImport of
         Just imp -> do
             fmap (nfp,) $ liftEither $
+#if MIN_VERSION_ghc(9,3,0)
+              Left ()
+#else
               rewriteToWEdit df doc
 #if !MIN_VERSION_ghc(9,2,0)
                 (annsA ps)
 #endif
                 $
                   extendImport (T.unpack <$> thingParent) (T.unpack newThing) (makeDeltaAst imp)
+#endif
         Nothing -> do
             let n = newImport importName sym importQual False
                 sym = if isNothing importQual then Just it else Nothing
@@ -252,7 +262,11 @@ extendImportHandler' ideState ExtendImport {..}
                   Just p  -> p <> "(" <> newThing <> ")"
             t <- liftMaybe $ snd <$> newImportToEdit
                 n
+#if !MIN_VERSION_ghc(9,3,0)
                 (astA ps)
+#else
+                ps
+#endif
                 (fromMaybe "" contents)
             return (nfp, WorkspaceEdit {_changes=Just (fromList [(doc,List [t])]), _documentChanges=Nothing, _changeAnnotations=Nothing})
   | otherwise =

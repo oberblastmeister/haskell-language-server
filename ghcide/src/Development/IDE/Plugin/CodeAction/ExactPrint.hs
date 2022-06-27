@@ -5,7 +5,14 @@
 {-# LANGUAGE CPP                #-}
 {-# LANGUAGE FlexibleInstances #-}
 
-module Development.IDE.Plugin.CodeAction.ExactPrint (
+module Development.IDE.Plugin.CodeAction.ExactPrint
+#if MIN_VERSION_ghc(9,3,0)
+  ( wildCardSymbol ) where
+
+wildCardSymbol :: String
+wildCardSymbol = ".."
+#else
+  (
   Rewrite (..),
   rewriteToEdit,
   rewriteToWEdit,
@@ -695,3 +702,5 @@ deleteFromImport (T.pack -> symbol) (L l idecl) llies@(L lieLoc lies) _ = do
             (filter ((/= symbol) . T.pack . Util.unpackFS . flLabel . unLoc) flds)
 #endif
   killLie v = Just v
+
+#endif
