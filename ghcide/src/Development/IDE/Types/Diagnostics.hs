@@ -27,7 +27,8 @@ import           Language.LSP.Diagnostics
 import           Language.LSP.Types                        as LSP (Diagnostic (..),
                                                                    DiagnosticSeverity (..),
                                                                    DiagnosticSource,
-                                                                   List (..))
+                                                                   List (..),
+                                                                   osPathFromNormalizedFilePath)
 
 import           Data.ByteString                           (ByteString)
 import           Development.IDE.Types.Location
@@ -110,7 +111,7 @@ prettyDiagnostics = vcat . map prettyDiagnostic
 prettyDiagnostic :: FileDiagnostic -> Doc Terminal.AnsiStyle
 prettyDiagnostic (fp, sh, LSP.Diagnostic{..}) =
     vcat
-        [ slabel_ "File:    " $ pretty (fromNormalizedFilePath fp)
+        [ slabel_ "File:    " $ pretty (show (osPathFromNormalizedFilePath fp))
         , slabel_ "Hidden:  " $ if sh == ShowDiag then "no" else "yes"
         , slabel_ "Range:   " $ prettyRange _range
         , slabel_ "Source:  " $ pretty _source

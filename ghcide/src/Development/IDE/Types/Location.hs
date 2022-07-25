@@ -29,7 +29,7 @@ module Development.IDE.Types.Location
 import           Control.Applicative
 import           Control.Monad
 import           Data.Hashable                (Hashable (hash))
-import           Data.Maybe                   (fromMaybe)
+import           Data.Maybe                   (fromJust, fromMaybe)
 import           Data.String
 
 #if MIN_VERSION_ghc(9,0,0)
@@ -47,11 +47,11 @@ import           Text.ParserCombinators.ReadP as ReadP
 toNormalizedFilePath' :: FilePath -> LSP.NormalizedFilePath
 -- We want to keep empty paths instead of normalising them to "."
 toNormalizedFilePath' "" = emptyFilePath
-toNormalizedFilePath' fp = LSP.toNormalizedFilePath fp
+toNormalizedFilePath' fp = fromJust (LSP.toNormalizedFilePath fp)
 
 emptyFilePath :: LSP.NormalizedFilePath
 #if MIN_VERSION_lsp_types(1,3,0)
-emptyFilePath = LSP.normalizedFilePath emptyPathUri ""
+emptyFilePath = fromJust (LSP.toNormalizedFilePath "")
 #else
 emptyFilePath = LSP.NormalizedFilePath emptyPathUri ""
 #endif
